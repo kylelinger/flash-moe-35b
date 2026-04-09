@@ -136,7 +136,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "."  // override with --model /path/to/Qwen3.5-35B-A3B-4bit
+#define MODEL_PATH_DEFAULT "/Users/kylexu/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec"
 
 // ============================================================================
 // Timing helper
@@ -5875,8 +5875,21 @@ static int sse_send_delta(int fd, const char *request_id, const char *token_text
     *w = '\0';
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"model\":\"qwen3.5-35b\",\"created\":%ld,"
         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
-        request_id, escaped);
+        request_id, (long)time(NULL), escaped);
+    ssize_t wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
+}
+
+// Send the initial SSE chunk with role
+static int sse_send_role(int fd, const char *request_id) {
+    char chunk[1024];
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"model\":\"qwen3.5-35b\",\"created\":%ld,"
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+        request_id, (long)time(NULL));
     ssize_t wr = write(fd, chunk, n);
     return (wr <= 0) ? -1 : 0;
 }
@@ -5885,9 +5898,10 @@ static void sse_send_done(int fd, const char *request_id) {
     char chunk[1024];
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"model\":\"qwen3.5-35b\",\"created\":%ld,"
         "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
         "data: [DONE]\n\n",
-        request_id);
+        request_id, (long)time(NULL));
     http_write(fd, chunk, n);
 }
 
@@ -6357,8 +6371,9 @@ static void serve_loop(
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
-            // ---- Send SSE headers ----
+            // ---- Send SSE headers + initial role chunk ----
             http_write_str(client_fd, SSE_HEADERS);
+            sse_send_role(client_fd, request_id);
 
             // ---- Batch prefill ----
             double t_prefill = now_ms();
@@ -6437,6 +6452,7 @@ static void serve_loop(
             int in_think = 0;
             int think_tokens = 0;
             int output_tokens = 0;  // non-thinking tokens (for max_gen limit)
+            int think_ended = 0;    // flag to strip leading whitespace after </think>
             // Accumulate response for session persistence
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
@@ -6462,7 +6478,7 @@ static void serve_loop(
 
                 // Think budget enforcement
                 if (next_token == THINK_START_TOKEN) in_think = 1;
-                if (next_token == THINK_END_TOKEN) in_think = 0;
+                if (next_token == THINK_END_TOKEN) { in_think = 0; think_ended = 1; }
                 if (in_think) {
                     think_tokens++;
                     if (g_think_budget > 0 && think_tokens >= g_think_budget) {
@@ -6481,13 +6497,22 @@ static void serve_loop(
                     gen_response[gen_resp_len] = 0;
                 }
                 // Filter out <think>...</think> from SSE output
+                // Also skip leading whitespace tokens right after </think>
                 if (!in_think && next_token != THINK_START_TOKEN && next_token != THINK_END_TOKEN) {
+                    if (think_ended && tok_str) {
+                        // Strip leading whitespace/newlines after </think>
+                        const char *p = tok_str;
+                        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+                        if (*p == '\0') goto skip_send;  // pure whitespace token, skip it
+                        think_ended = 0;
+                    }
                     if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
                         fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
                         break;
                     }
                     output_tokens++;
                 }
+                skip_send:
                 gen_count++;
 
                 // Generate next
