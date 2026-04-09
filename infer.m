@@ -75,6 +75,7 @@
 #define NUM_KV_HEADS        2
 #define HEAD_DIM            256
 #define VOCAB_SIZE          248320
+#define MAX_CONTEXT_TOKENS  50000   // max total context (prompt + generation)
 #define RMS_NORM_EPS        1e-6f
 #define NUM_EXPERTS         256
 #define NUM_EXPERTS_PER_TOK 4
@@ -5778,6 +5779,188 @@ static char *extract_last_content(char *buf) {
     return last;
 }
 
+// Unescape a JSON string in-place: \n -> newline, \" -> quote, \\ -> backslash, etc.
+static void json_unescape_inplace(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        if (*r == '\\' && *(r+1)) {
+            r++;
+            switch (*r) {
+                case 'n':  *w++ = '\n'; r++; break;
+                case 't':  *w++ = '\t'; r++; break;
+                case 'r':  *w++ = '\r'; r++; break;
+                case '"':  *w++ = '"';  r++; break;
+                case '\\': *w++ = '\\'; r++; break;
+                case '/':  *w++ = '/';  r++; break;
+                default:   *w++ = '\\'; *w++ = *r++; break;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
+// Find the end of a JSON string starting at the opening quote.
+// Returns pointer to the closing quote, or NULL.
+static char *find_json_string_end(char *start) {
+    char *p = start + 1; // skip opening quote
+    while (*p) {
+        if (*p == '\\') { p += 2; continue; } // skip escaped char
+        if (*p == '"') return p;
+        p++;
+    }
+    return NULL;
+}
+
+// Parse OpenAI-format messages array and build a complete ChatML prompt.
+// Format: <|im_start|>role\ncontent<|im_end|>\n ... <|im_start|>assistant\n
+// Returns malloc'd string, caller must free.
+// If the body has no "messages" array, returns NULL.
+static char *build_chatml_from_messages(char *body) {
+    // Find "messages" array
+    char *arr = strstr(body, "\"messages\"");
+    if (!arr) return NULL;
+    arr = strchr(arr, '[');
+    if (!arr) return NULL;
+    arr++; // skip '['
+
+    // Allocate output buffer (generous: 2x body size)
+    size_t body_len = strlen(body);
+    size_t out_cap = body_len * 2 + 4096;
+    char *out = malloc(out_cap);
+    if (!out) return NULL;
+    size_t out_len = 0;
+
+    #define CHATML_APPEND(s) do { \
+        size_t _l = strlen(s); \
+        if (out_len + _l < out_cap - 1) { memcpy(out + out_len, s, _l); out_len += _l; } \
+    } while(0)
+
+    #define CHATML_APPEND_N(s, n) do { \
+        if (out_len + (n) < out_cap - 1) { memcpy(out + out_len, s, n); out_len += (n); } \
+    } while(0)
+
+    char *p = arr;
+    int msg_count = 0;
+
+    while (*p) {
+        // Skip whitespace and commas
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == ']') break; // end of messages array
+        if (*p != '{') break; // unexpected
+
+        p++; // skip '{'
+
+        // Extract role and content from this message object
+        char role[32] = {0};
+        char *content_start = NULL;
+        size_t content_len = 0;
+
+        int brace_depth = 1;
+        char *obj_start = p;
+
+        // Simple state machine to extract role and content
+        while (*p && brace_depth > 0) {
+            if (*p == '{') { brace_depth++; p++; continue; }
+            if (*p == '}') { brace_depth--; if (brace_depth == 0) break; p++; continue; }
+            if (*p == '"') {
+                // Check if this is "role" or "content" key (only at top level)
+                if (brace_depth == 1) {
+                    if (strncmp(p, "\"role\"", 6) == 0) {
+                        p += 6;
+                        while (*p == ' ' || *p == ':') p++;
+                        if (*p == '"') {
+                            char *end = find_json_string_end(p);
+                            if (end) {
+                                size_t rlen = end - p - 1;
+                                if (rlen < sizeof(role)) { memcpy(role, p+1, rlen); role[rlen] = 0; }
+                                p = end + 1;
+                                continue;
+                            }
+                        }
+                    } else if (strncmp(p, "\"content\"", 9) == 0) {
+                        p += 9;
+                        while (*p == ' ' || *p == ':') p++;
+                        if (*p == '"') {
+                            char *end = find_json_string_end(p);
+                            if (end) {
+                                content_start = p + 1;
+                                content_len = end - content_start;
+                                p = end + 1;
+                                continue;
+                            }
+                        } else if (strncmp(p, "null", 4) == 0) {
+                            p += 4;
+                            continue;
+                        } else if (*p == '[') {
+                            // content is an array (multimodal) — skip it, extract text parts
+                            // For now just skip the array
+                            int arr_depth = 1;
+                            p++;
+                            while (*p && arr_depth > 0) {
+                                if (*p == '[') arr_depth++;
+                                else if (*p == ']') arr_depth--;
+                                else if (*p == '"') { char *e = find_json_string_end(p); if (e) p = e; }
+                                p++;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Skip any other string
+                char *end = find_json_string_end(p);
+                if (end) p = end + 1;
+                else p++;
+                continue;
+            }
+            p++;
+        }
+        if (*p == '}') p++; // skip closing brace
+
+        // Build ChatML for this message
+        if (role[0] && content_start) {
+            // Temporarily null-terminate and unescape the content
+            char saved = content_start[content_len];
+            content_start[content_len] = '\0';
+
+            // Copy content to temp buffer for unescaping
+            char *content_copy = malloc(content_len + 1);
+            memcpy(content_copy, content_start, content_len + 1);
+            content_start[content_len] = saved; // restore
+
+            json_unescape_inplace(content_copy);
+
+            CHATML_APPEND("<|im_start|>");
+            CHATML_APPEND(role);
+            CHATML_APPEND("\n");
+            CHATML_APPEND(content_copy);
+            CHATML_APPEND("<|im_end|>\n");
+
+            free(content_copy);
+            msg_count++;
+        } else if (role[0]) {
+            // Message with no content (e.g. tool_calls only) — skip
+        }
+    }
+
+    // Append assistant prompt
+    CHATML_APPEND("<|im_start|>assistant\n");
+
+    out[out_len] = '\0';
+
+    #undef CHATML_APPEND
+    #undef CHATML_APPEND_N
+
+    if (msg_count == 0) {
+        free(out);
+        return NULL;
+    }
+
+    fprintf(stderr, "[serve] ChatML built: %d messages, %zu chars\n", msg_count, out_len);
+    return out;
+}
+
 // Extract "max_tokens" or "max_completion_tokens" from JSON body. Returns value or default.
 static int extract_max_tokens(const char *buf, int default_val) {
     const char *p = strstr(buf, "\"max_completion_tokens\"");
@@ -6261,42 +6444,52 @@ static void serve_loop(
             body += 4;
 
             // Extract session_id and max_tokens BEFORE content extraction
-            // (extract_last_content mutates the body buffer in place)
             int max_gen = extract_max_tokens(body, 8192);
             if (max_gen > 32768) max_gen = 32768;
             char req_session_id[64] = {0};
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
 
-            // Extract user content from messages (mutates body — must be last)
-            char *content = extract_last_content(body);
-            if (!content || strlen(content) == 0) {
-                http_write_str(client_fd,
-                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
-                    "{\"error\":\"no content in messages\"}\n");
-                free(reqbuf); close(client_fd); continue;
-            }
-            int is_continuation = (has_session &&
-                                   active_session_id[0] != '\0' &&
-                                   strcmp(req_session_id, active_session_id) == 0);
-
-            // Session persistence is handled by the client (chat.m)
-
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
-                    request_id, strlen(content), max_gen,
-                    has_session ? req_session_id : "(none)",
-                    is_continuation ? " [CONTINUE]" : " [NEW]");
+            // ---- Parse messages array into ChatML ----
+            // Make a copy of body for build_chatml (it may need the original intact)
+            char *body_copy = strdup(body);
+            char *chatml = build_chatml_from_messages(body_copy);
+            free(body_copy);
 
-            // ---- Tokenize ----
-            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
-            // New session: just the user turn (system prompt restored from snapshot)
             PromptTokens *pt;
-            if (is_continuation) {
-                pt = tokenize_continuation_turn(content);
+            int use_chatml = 0;  // flag: 1 = full ChatML (skip system prompt restore)
+
+            if (chatml) {
+                // Full ChatML prompt — tokenize directly (includes system prompt from client)
+                pt = encode_prompt_text_to_tokens(chatml);
+                use_chatml = 1;
+                fprintf(stderr, "[serve] %s ChatML prompt=%zu chars, max_tokens=%d, session=%s\n",
+                        request_id, strlen(chatml), max_gen,
+                        has_session ? req_session_id : "(none)");
+                free(chatml);
             } else {
-                pt = tokenize_user_turn(content);
+                // Fallback: extract last content (old behavior for simple clients)
+                char *content = extract_last_content(body);
+                if (!content || strlen(content) == 0) {
+                    http_write_str(client_fd,
+                        "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+                        "{\"error\":\"no content in messages\"}\n");
+                    free(reqbuf); close(client_fd); continue;
+                }
+                int is_continuation = (has_session &&
+                                       active_session_id[0] != '\0' &&
+                                       strcmp(req_session_id, active_session_id) == 0);
+                fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
+                        request_id, strlen(content), max_gen,
+                        has_session ? req_session_id : "(none)",
+                        is_continuation ? " [CONTINUE]" : " [NEW]");
+                if (is_continuation) {
+                    pt = tokenize_continuation_turn(content);
+                } else {
+                    pt = tokenize_user_turn(content);
+                }
             }
             if (!pt) {
                 http_write_str(client_fd,
@@ -6305,26 +6498,62 @@ static void serve_loop(
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
-                    is_continuation ? " (continuation — skipping snapshot restore)" : "");
+            // Enforce context length limit — truncate prompt if too long
+            if (pt->count > MAX_CONTEXT_TOKENS) {
+                fprintf(stderr, "[serve] %s WARNING: prompt %d tokens exceeds limit %d, truncating\n",
+                        request_id, pt->count, MAX_CONTEXT_TOKENS);
+                pt->count = MAX_CONTEXT_TOKENS;
+            }
+
+            fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, pt->count);
 
             int pos;
-            if (is_continuation) {
-                // ---- Continue from existing session state ----
-                // The KV caches + linear attention state already contain the full
-                // conversation history. Just set pos to where we left off.
-                pos = session_pos;
+            if (use_chatml) {
+                // ---- Full ChatML mode: reset all state, prefill from scratch ----
+                // The client provides the full conversation history in messages[],
+                // so we don't use server-side session caching.
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    if (kv_caches[i]) {
+                        kv_caches[i]->len = 0;
+                    }
+                    if (layer_states[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        memset(s->conv_state, 0, conv_state_size);
+                        memset(s->ssm_state, 0, ssm_state_size);
+                    }
+                }
+                // Reset GPU state
+                if (g_metal && g_metal->delta_net_step) {
+                    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+                        if (g_metal->buf_delta_state[i])
+                            memset([g_metal->buf_delta_state[i] contents], 0,
+                                   LINEAR_NUM_V_HEADS*LINEAR_KEY_DIM*LINEAR_VALUE_DIM*sizeof(float));
+                        if (g_metal->buf_conv_state[i])
+                            memset([g_metal->buf_conv_state[i] contents], 0,
+                                   (CONV_KERNEL_SIZE-1)*LINEAR_CONV_DIM*sizeof(float));
+                    }
+                } else {
+                    reset_delta_net_state();
+                }
+                // Reset GPU KV caches
+                if (g_metal) {
+                    for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+                        if (g_metal->buf_kv_k[i])
+                            memset([g_metal->buf_kv_k[i] contents], 0, [g_metal->buf_kv_k[i] length]);
+                        if (g_metal->buf_kv_v[i])
+                            memset([g_metal->buf_kv_v[i] contents], 0, [g_metal->buf_kv_v[i] length]);
+                    }
+                }
+                pos = 0;  // start from scratch — ChatML includes everything
+                active_session_id[0] = '\0';
             } else {
-                // ---- Restore state from system prompt snapshot ----
-                // Instead of resetting to zero, restore to the cached system prompt state.
-                // This skips re-prefilling the system prompt tokens (~20 tokens, ~6s saved).
+                // ---- Legacy mode: restore from system prompt snapshot ----
                 for (int i = 0; i < NUM_LAYERS; i++) {
                     if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
                         size_t sz = sys_prompt_len * kv_dim * sizeof(float);
                         memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
                         memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
                         kv_caches[i]->len = kv_snapshots[i].len;
-                        // Also restore GPU KV mirror
                         if (g_metal) {
                             int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
                             if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
@@ -6347,7 +6576,6 @@ static void serve_loop(
                         memset(s->ssm_state, 0, ssm_state_size);
                     }
                 }
-                // Restore GPU delta-net state
                 if (g_metal && g_metal->delta_net_step) {
                     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
                         if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
@@ -6360,8 +6588,7 @@ static void serve_loop(
                 } else {
                     reset_delta_net_state();
                 }
-                pos = sys_prompt_len;  // start after cached system prompt
-                // Update active session
+                pos = sys_prompt_len;
                 if (has_session) {
                     strncpy(active_session_id, req_session_id, sizeof(active_session_id) - 1);
                     active_session_id[sizeof(active_session_id) - 1] = '\0';
