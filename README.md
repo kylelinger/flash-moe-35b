@@ -90,15 +90,35 @@ make infer
 
 **HTTP Server (OpenAI-compatible API):**
 ```bash
-./infer --serve 5414 --k 4
+# 后台启动
+nohup ./infer --serve 5414 --k 4 > /tmp/flash-moe-35b-server.log 2>&1 &
+echo "PID: $!"
+
+# 等待就绪 (~5s)
+until curl -s http://localhost:5414/health > /dev/null 2>&1; do sleep 1; done
+echo "Service ready!"
 ```
 
-Then query with any OpenAI-compatible client:
+**测试：**
 ```bash
 curl http://localhost:5414/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.5-35b","messages":[{"role":"user","content":"Hello!"}],"max_tokens":50}'
 ```
+
+**停止服务：**
+```bash
+kill $(pgrep -f "infer --serve")
+```
+
+**检查服务状态：**
+```bash
+curl -s http://localhost:5414/health   # API 健康检查
+ps aux | grep "infer --serve"          # 查看进程
+tail -5 /tmp/flash-moe-35b-server.log  # 查看日志
+```
+
+> 详细的服务管理说明、Python/JS 调用示例见 [docs/DEPLOY_GUIDE.md](docs/DEPLOY_GUIDE.md)
 
 ## Project Structure
 

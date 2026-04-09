@@ -111,88 +111,295 @@ make infer
 
 Build output: `./infer` (~140 KB binary). Metal shaders compile at runtime on first launch (~260ms, then cached by the OS).
 
-## Step 5: Run
+---
 
-### Single Prompt
+## Step 5: 服务管理 (启动/停止/状态检查)
 
-```bash
-cd weights/  # or wherever model_weights.bin is
-../infer --model $MODEL_PATH --prompt "Hello, world!" --tokens 50 --k 4
-```
+### 启动服务
 
-### HTTP Server (Production)
-
+**前台运行（调试用）：**
 ```bash
 cd weights/
 ../infer --model $MODEL_PATH --serve 5414 --k 4
 ```
 
-Server starts and pre-caches the system prompt (~3s). Then it's ready for requests:
+**后台运行（推荐）：**
+```bash
+cd weights/
+nohup ../infer --model $MODEL_PATH --serve 5414 --k 4 > /tmp/flash-moe-35b-server.log 2>&1 &
+echo "Server PID: $!"
+```
+
+**等待服务就绪：**
+
+启动后需要等待系统提示词预填充完成（约 3-5 秒），可通过日志确认：
+```bash
+# 查看启动日志，等待 "System prompt cached" 出现
+tail -f /tmp/flash-moe-35b-server.log
+# 看到以下输出说明服务就绪：
+# [serve] System prompt cached: 21 tokens prefilled
+# Ctrl+C 退出 tail
+```
+
+或用 health check 轮询：
+```bash
+# 等待服务就绪
+until curl -s http://localhost:5414/health > /dev/null 2>&1; do sleep 1; done
+echo "Service ready!"
+```
+
+### 检查服务状态
 
 ```bash
-# Health check
-curl http://localhost:5414/health
+# 方法1: Health check API
+curl -s http://localhost:5414/health
+# 返回: {"status":"ok","model":"qwen3.5-397b-a17b"}
 
-# Chat completion
+# 方法2: 查看进程
+ps aux | grep "infer --serve" | grep -v grep
+
+# 方法3: 查看日志
+tail -20 /tmp/flash-moe-35b-server.log
+```
+
+### 停止服务
+
+```bash
+# 方法1: 通过 PID 停止（推荐）
+kill $(pgrep -f "infer --serve")
+
+# 方法2: 如果知道 PID
+kill <PID>
+
+# 确认已停止
+ps aux | grep "infer --serve" | grep -v grep
+# 应无输出
+```
+
+### 重启服务
+
+```bash
+# 先停止
+kill $(pgrep -f "infer --serve") 2>/dev/null
+sleep 2
+
+# 再启动
+cd weights/
+nohup ../infer --model $MODEL_PATH --serve 5414 --k 4 > /tmp/flash-moe-35b-server.log 2>&1 &
+echo "Restarted, PID: $!"
+
+# 等待就绪
+until curl -s http://localhost:5414/health > /dev/null 2>&1; do sleep 1; done
+echo "Service ready!"
+```
+
+### 端口冲突处理
+
+如果端口 5414 被占用：
+```bash
+# 查看谁占用了端口
+lsof -i :5414
+
+# 换一个端口启动
+../infer --model $MODEL_PATH --serve 8080 --k 4
+```
+
+---
+
+## Step 6: 使用服务
+
+### 6a. 命令行 curl 测试
+
+```bash
+# 基础对话
 curl http://localhost:5414/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5-35b",
-    "messages": [{"role": "user", "content": "Tell me a joke"}],
-    "max_tokens": 100
+    "messages": [{"role": "user", "content": "你好，请用中文介绍一下自己"}],
+    "max_tokens": 200
   }'
+
+# 查看可用模型
+curl http://localhost:5414/v1/models
 ```
 
-### OpenAI SDK Compatible
+### 6b. Python 调用（OpenAI SDK 兼容）
+
+```bash
+pip3 install openai
+```
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:5414/v1", api_key="unused")
+# 连接本地 Flash-MoE 服务
+client = OpenAI(
+    base_url="http://localhost:5414/v1",
+    api_key="unused"  # 本地服务无需 API key
+)
+
+# 非流式调用
 response = client.chat.completions.create(
     model="qwen3.5-35b",
-    messages=[{"role": "user", "content": "What is the meaning of life?"}],
+    messages=[
+        {"role": "user", "content": "什么是量子计算？用简单的话解释"}
+    ],
+    max_tokens=200,
+    stream=False
+)
+# 注意：非流式模式下也返回 SSE 格式，需要解析
+
+# 流式调用（推荐）
+response = client.chat.completions.create(
+    model="qwen3.5-35b",
+    messages=[
+        {"role": "user", "content": "写一首关于春天的诗"}
+    ],
     max_tokens=200,
     stream=True
 )
 for chunk in response:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="", flush=True)
+print()
 ```
+
+### 6c. JavaScript/Node.js 调用
+
+```javascript
+const response = await fetch('http://localhost:5414/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    model: 'qwen3.5-35b',
+    messages: [{ role: 'user', content: 'Hello!' }],
+    max_tokens: 100
+  })
+});
+
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  const text = decoder.decode(value);
+  // 解析 SSE 格式: "data: {...}\n\n"
+  for (const line of text.split('\n')) {
+    if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+      const data = JSON.parse(line.slice(6));
+      const content = data.choices?.[0]?.delta?.content;
+      if (content) process.stdout.write(content);
+    }
+  }
+}
+```
+
+### 6d. 单次命令行推理（不启动服务）
+
+```bash
+cd weights/
+../infer --model $MODEL_PATH --prompt "Explain relativity" --tokens 100 --k 4
+```
+
+---
+
+## API 参考
+
+### POST /v1/chat/completions
+
+OpenAI-compatible chat completions endpoint, 支持 SSE 流式输出。
+
+**请求体：**
+```json
+{
+  "model": "qwen3.5-35b",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Your question here"}
+  ],
+  "max_tokens": 100,
+  "stream": true
+}
+```
+
+**响应格式（SSE 流）：**
+```
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+### GET /v1/models
+
+返回可用模型列表。
+
+### GET /health
+
+返回服务健康状态：`{"status":"ok","model":"..."}`
+
+---
+
+## 与 SwiftLM 的关系
+
+本项目**替代** SwiftLM 来驱动 Qwen3.5-35B-A3B-4bit 模型：
+
+| 对比 | SwiftLM | Flash-MoE |
+|------|---------|-----------|
+| 端口 | 5413 | 5414 |
+| 生成速度 | 1.72 tok/s | 6.61 tok/s |
+| 引擎 | Swift/MLX (预编译) | Objective-C/Metal (源码编译) |
+| Expert 加载 | 逐个串行 + GPU 同步 | 并行 pread + 延迟 GPU |
+| 依赖 | SwiftLM 二进制 | 仅 clang + Metal framework |
+
+**如果不再需要 SwiftLM，停止它：**
+```bash
+kill $(pgrep -f SwiftLM)
+```
+
+---
 
 ## Troubleshooting
 
 ### "Cannot open vocab vocab.bin"
-The inference engine looks for `vocab.bin`, `tokenizer.bin`, and `model_weights.bin` in the current working directory. Either:
-- `cd` to the weights directory before running
-- Use `--vocab`, `--weights`, `--manifest` flags to specify paths
+推理引擎在当前工作目录查找 `vocab.bin`、`tokenizer.bin`、`model_weights.bin`。可以：
+- `cd` 到 weights 目录再运行
+- 用 `--vocab`、`--weights`、`--manifest` 参数指定路径
 
-### Slow First Token
-The first token after startup is slower (~1.7s) because:
-1. Metal shader compilation (~260ms, first run only)
-2. System prompt prefill (~3s for 21 tokens)
-3. Expert weight page cache is cold
+### 首 Token 较慢
+启动后第一个 token 较慢（~1.7s）：
+1. Metal shader 编译（~260ms，仅首次）
+2. System prompt 预填充（~3s，21 tokens）
+3. Expert 权重页面缓存为冷缓存
 
-Subsequent tokens reach full speed (6+ tok/s) after page cache warms up.
+后续 token 在页面缓存预热后达到全速（6+ tok/s）。
 
-### Out of Memory
-If the process gets killed (signal 9):
-- Reduce K from 4 to 3 (quality may degrade)
-- Close other memory-intensive apps
-- The engine needs ~2 GB RAM + SSD bandwidth for experts
+### 进程被 Kill（信号 9）
+这是 macOS 的内存压力终止（OOM kill）：
+- 关闭其他占内存的应用
+- 确认没有同时运行 SwiftLM 和 Flash-MoE
+- 引擎需要 ~2 GB RAM + SSD 带宽
 
-### Garbled Output
-If the HTTP API returns BPE-encoded tokens (like `Ġ` for space):
-- Ensure `vocab.bin` was generated with `export_vocab.py` (includes BPE byte decoding)
-- Don't use `tokenizer.bin` as `vocab.bin` — they are different formats
+### 输出乱码
+如果 API 返回 BPE 编码 token（如 `Ġ` 代替空格）：
+- 确保 `vocab.bin` 由 `export_vocab.py` 生成（包含 BPE 字节解码）
+- 不要把 `tokenizer.bin` 当 `vocab.bin` 用——格式不同
 
-## File Locations Summary
+### 长上下文响应慢
+Prefill 阶段是逐 token 处理，8K token 上下文需要约 15 分钟。这是当前的限制，生成阶段不受影响（仍然 4-6 tok/s）。
 
-| File | Location | Size | Description |
-|------|----------|------|-------------|
-| model_weights.bin | weights/ | 1.4 GB | Non-expert weights (mmap'd) |
-| model_weights.json | weights/ | 246 KB | Weight tensor manifest |
-| vocab.bin | weights/ | 2.2 MB | Decoded vocabulary for output |
-| tokenizer.bin | weights/ | 7.8 MB | BPE tokenizer for input |
-| packed_experts/ | $MODEL_PATH/ | 17 GB | Per-layer expert binaries |
-| config.json | $MODEL_PATH/ | 2 KB | Model architecture config |
+---
+
+## 文件位置总览
+
+| 文件 | 位置 | 大小 | 说明 |
+|------|------|------|------|
+| model_weights.bin | weights/ | 1.4 GB | 非 expert 权重（mmap 加载） |
+| model_weights.json | weights/ | 246 KB | 权重张量清单 |
+| vocab.bin | weights/ | 2.2 MB | 解码词表（输出用） |
+| tokenizer.bin | weights/ | 7.8 MB | BPE 分词器（输入用） |
+| packed_experts/ | $MODEL_PATH/ | 17 GB | 按层打包的 expert 二进制文件 |
+| config.json | $MODEL_PATH/ | 2 KB | 模型架构配置 |
+| /tmp/flash-moe-35b-server.log | /tmp/ | — | 服务运行日志 |
