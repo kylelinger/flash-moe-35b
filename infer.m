@@ -5959,7 +5959,7 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant. /think");
+    return strdup("You are a helpful assistant.");
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
@@ -6436,11 +6436,12 @@ static void serve_loop(
             int gen_count = 0;
             int in_think = 0;
             int think_tokens = 0;
+            int output_tokens = 0;  // non-thinking tokens (for max_gen limit)
             // Accumulate response for session persistence
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
-            for (int gen = 0; gen < max_gen; gen++) {
+            for (int gen = 0; output_tokens < max_gen; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
                     // Feed EOS through the model so session state includes it
                     cache_telemetry_note_token();
@@ -6472,15 +6473,20 @@ static void serve_loop(
 
                 const char *tok_str = decode_token(vocab, next_token);
                 // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                if (!in_think && next_token != THINK_END_TOKEN &&
+                    tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                     int tlen = (int)strlen(tok_str);
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                    break;
+                // Filter out <think>...</think> from SSE output
+                if (!in_think && next_token != THINK_START_TOKEN && next_token != THINK_END_TOKEN) {
+                    if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                        fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                        break;
+                    }
+                    output_tokens++;
                 }
                 gen_count++;
 
