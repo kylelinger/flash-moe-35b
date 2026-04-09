@@ -6632,6 +6632,17 @@ static void serve_loop(
                 }
                 discard_deferred_experts();
                 pos++;
+
+                // Send SSE keepalive comment every 50 tokens to prevent client timeout
+                if (i > 0 && i % 50 == 0) {
+                    char keepalive[128];
+                    int kn = snprintf(keepalive, sizeof(keepalive),
+                        ": prefill %d/%d tokens\n\n", i, pt->count - 1);
+                    if (write(client_fd, keepalive, kn) <= 0) {
+                        fprintf(stderr, "[serve] %s client disconnected during prefill\n", request_id);
+                        break;
+                    }
+                }
             }
             // Last prefill token: full completion (need hidden for logits)
             {
