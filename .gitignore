@@ -1,0 +1,21 @@
+# Build artifacts
+infer
+metal_infer
+chat
+*.air
+*.metallib
+*.o
+
+# Weight files (too large for git)
+*.bin
+weights/
+packed_experts/
+
+# OS files
+.DS_Store
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
