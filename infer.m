@@ -136,7 +136,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/kylexu/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec"
+#define MODEL_PATH_DEFAULT "."  // override with --model /path/to/Qwen3.5-35B-A3B-4bit
 
 // ============================================================================
 // Timing helper

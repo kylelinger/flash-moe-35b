@@ -35,11 +35,7 @@ def decode_bpe_token(token_str):
     except Exception:
         return token_str.encode('utf-8', errors='replace')
 
-model_path = os.path.expanduser(
-    '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit'
-    '/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec'
-)
-tok_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(model_path, 'tokenizer.json')
+tok_path = sys.argv[1] if len(sys.argv) > 1 else 'tokenizer.json'
 out_path = sys.argv[2] if len(sys.argv) > 2 else 'vocab.bin'
 
 with open(tok_path, 'r', encoding='utf-8') as f:
